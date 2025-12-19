@@ -116,6 +116,46 @@ class SDTrainer(BaseSDTrainProcess):
 
     def before_model_load(self):
         pass
+
+    def _get_control_images_for_prompt(self, batch: DataLoaderBatchDTO):
+        """
+        Prepare control images for models that encode them in the text encoder.
+        Supports both a batched tensor (control_tensor) and a list-of-lists per item (control_tensor_list).
+        """
+        if not self.sd.encode_control_in_text_embeddings or batch is None:
+            return None
+
+        control_images = None
+        if getattr(batch, "control_tensor", None) is not None:
+            control_images = batch.control_tensor
+        elif getattr(batch, "control_tensor_list", None) is not None:
+            control_lists = batch.control_tensor_list
+            if len(control_lists) == 0:
+                return None
+            num_controls = len(control_lists[0])
+            for control_list in control_lists:
+                if len(control_list) != num_controls:
+                    raise ValueError("Control tensor count does not match across batch items")
+            control_images = []
+            for control_idx in range(num_controls):
+                stacked_images = []
+                for per_item_controls in control_lists:
+                    ctrl_img = per_item_controls[control_idx]
+                    if ctrl_img is None:
+                        raise ValueError("Missing control tensor for batch item when encoding prompts")
+                    if ctrl_img.dim() == 3:
+                        ctrl_img = ctrl_img.unsqueeze(0)
+                    stacked_images.append(ctrl_img)
+                control_images.append(torch.cat(stacked_images, dim=0))
+
+        if control_images is None:
+            return None
+        if isinstance(control_images, list):
+            return [
+                img.to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                for img in control_images
+            ]
+        return control_images.to(self.sd.device_torch, dtype=self.sd.torch_dtype)
     
     def cache_sample_prompts(self):
         if self.train_config.disable_sampling:
@@ -1102,14 +1142,16 @@ class SDTrainer(BaseSDTrainProcess):
                     embeds_to_use = batch.prompt_embeds.clone().to(self.device_torch, dtype=dtype)
                 else:
                     prompt_kwargs = {}
-                    if self.sd.encode_control_in_text_embeddings and batch.control_tensor is not None:
-                        prompt_kwargs['control_images'] = batch.control_tensor.to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                    control_images = self._get_control_images_for_prompt(batch)
+                    if control_images is not None:
+                        prompt_kwargs['control_images'] = control_images
                     embeds_to_use = self.sd.encode_prompt(
                         prompt_list,
-                        long_prompts=self.do_long_prompts).to(
-                        self.device_torch,
-                        dtype=dtype,
+                        long_prompts=self.do_long_prompts,
                         **prompt_kwargs
+                    ).to(
+                        self.device_torch,
+                        dtype=dtype
                     ).detach()
 
             # dont use network on this
@@ -1490,8 +1532,9 @@ class SDTrainer(BaseSDTrainProcess):
                 with self.timer('encode_prompt'):
                     unconditional_embeds = None
                     prompt_kwargs = {}
-                    if self.sd.encode_control_in_text_embeddings and batch.control_tensor is not None:
-                        prompt_kwargs['control_images'] = batch.control_tensor.to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                    control_images = self._get_control_images_for_prompt(batch)
+                    if control_images is not None:
+                        prompt_kwargs['control_images'] = control_images
                     if self.train_config.unload_text_encoder or self.is_caching_text_embeddings:
                         with torch.set_grad_enabled(False):
                             if batch.prompt_embeds is not None:
